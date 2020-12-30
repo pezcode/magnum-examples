@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
     Vk::Image image{NoCreate};
     {
         Vk::ImageCreateInfo2D info{Vk::ImageUsage::ColorAttachment,
-        VK_FORMAT_R8G8B8A8_SRGB, {800, 600}, 1};
+            VK_FORMAT_R8G8B8A8_SRGB, {800, 600}, 1};
         info->tiling = VK_IMAGE_TILING_LINEAR;
         image = Vk::Image{device, info, Vk::MemoryFlag::HostVisible};
     }
