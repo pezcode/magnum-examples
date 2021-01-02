@@ -77,37 +77,52 @@ int main(int argc, char** argv) {
     instance.populateGlobalFunctionPointers();
     device.populateGlobalFunctionPointers();
 
+    /* External subpass dependency */
+    VkSubpassDependency externalDependency{};
+    externalDependency.srcSubpass = 0;
+    externalDependency.dstSubpass = VK_SUBPASS_EXTERNAL;
+    externalDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    externalDependency.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    externalDependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    externalDependency.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
     /* Render pass */
     Vk::RenderPass renderPass{device, Vk::RenderPassCreateInfo{}
         .setAttachments({
-            {VK_FORMAT_R8G8B8A8_SRGB, Vk::AttachmentLoadOperation::Clear, {}}
+            {VK_FORMAT_R8G8B8A8_SRGB, Vk::AttachmentLoadOperation::Clear, Vk::AttachmentStoreOperation::Store,
+                Vk::ImageLayout::Undefined, Vk::ImageLayout::TransferSource /*ColorAttachment*/}
         })
         .addSubpass(Vk::SubpassDescription{}
-            .setColorAttachments({0})
+            .setColorAttachments({{0, Vk::ImageLayout::ColorAttachment}})
         )
+        .setDependencies({Vk::SubpassDependency{externalDependency}})
     };
 
-    /* Framebuffer image. Allocate with linear tiling as we want to download it
-       later. */
+    /* Framebuffer image */
     Vk::Image image{NoCreate};
     {
-        Vk::ImageCreateInfo2D info{Vk::ImageUsage::ColorAttachment,
+        Vk::ImageCreateInfo2D info{Vk::ImageUsage::ColorAttachment | Vk::ImageUsage::TransferSource,
             VK_FORMAT_R8G8B8A8_SRGB, {800, 600}, 1};
-        info->tiling = VK_IMAGE_TILING_LINEAR;
-        image = Vk::Image{device, info, Vk::MemoryFlag::HostVisible};
+        image = Vk::Image{device, info, Vk::MemoryFlag::DeviceLocal };
     }
 
     Vk::ImageView color{device, Vk::ImageViewCreateInfo2D{image}};
 
+    /* Image read-back buffer to avoid having to use linear tiling for the
+       framebuffer image (which might not be supported for a color attachment) */
+    Vk::Buffer readbackBuffer{ device, Vk::BufferCreateInfo{
+            Vk::BufferUsage::TransferDestination, 800 * 600 * 4 /* R8,G8,B8,A8 for each pixel */
+        }, Vk::MemoryFlag::HostVisible };
+
     /* Vertex buffer */
-    Vk::Buffer buffer{device, Vk::BufferCreateInfo{
+    Vk::Buffer vertexBuffer{device, Vk::BufferCreateInfo{
             Vk::BufferUsage::VertexBuffer,
             3*2*4*4 /* Three vertices, each is four-element pos & color */
         }, Vk::MemoryFlag::HostVisible};
     {
         /* Fill the data */
         /** @todo arrayCast for an array rvalue */
-        Containers::Array<char, Vk::MemoryMapDeleter> data = buffer.dedicatedMemory().map();
+        Containers::Array<char, Vk::MemoryMapDeleter> data = vertexBuffer.dedicatedMemory().map();
         auto view = Containers::arrayCast<Vector4>(data);
         view[0] = {-0.5f, -0.5f, 0.0f, 1.0f}; /* Left vertex, red color */
         view[1] = 0xff0000ff_srgbaf;
@@ -131,6 +146,7 @@ int main(int argc, char** argv) {
                OpEntryPoint Vertex %1 "ver" %12 %13 %gl_Position %16
 ; Function %2 is fragment shader and has %5 as input and %6 as output
                OpEntryPoint Fragment %2 "fra" %5 %6
+               OpExecutionMode %2 OriginUpperLeft
 
 ; Input/output layouts
                OpDecorate %12 Location 0
@@ -277,13 +293,38 @@ int main(int argc, char** argv) {
     /* Begin recording */
     cmd.begin();
 
-    /* Convert the image to the proper layout */
+    /* Begin a render pass */
+    cmd.beginRenderPass(Vk::RenderPassBeginInfo{renderPass, framebuffer}
+        .clearColor(0, 0x1f1f1f_srgbf));
+
+    /* Bind the pipeline */
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+    /* Bind the vertex buffer */
+    {
+        const VkDeviceSize offset = 0;
+        const VkBuffer handle = vertexBuffer;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &handle, &offset);
+    }
+
+    /* Draw the triangle */
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+
+    /* End a render pass */
+    cmd.endRenderPass();
+
+    /* Transition image layout after the draw finishes.
+       This barrier is redundant with a final attachment layout of TransferSource
+       and a subpass dependency from 0 to EXTERNAL to synchronize the implicit
+       layout transition with the transfer operation. */
+    /*
     {
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.image = image;
@@ -292,29 +333,32 @@ int main(int argc, char** argv) {
         barrier.subresourceRange.levelCount = 1;
         barrier.subresourceRange.baseArrayLayer = 0;
         barrier.subresourceRange.layerCount = 1;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
+    */
 
-    /* Begin a render pass */
-    cmd.beginRenderPass(Vk::RenderPassBeginInfo{renderPass, framebuffer}
-           .clearColor(0, 0x1f1f1f_srgbf));
-
-    /* Bind the pipeline */
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-    /* Bind the vertex buffer */
+    /* Copy the image to the read-back buffer */
     {
-        const VkDeviceSize offset = 0;
-        const VkBuffer handle = buffer;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &handle, &offset);
+        VkBufferImageCopy info{};
+        info.imageExtent = VkExtent3D{800, 600, 1};
+        info.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        info.imageSubresource.mipLevel = 0;
+        info.imageSubresource.baseArrayLayer = 0;
+        info.imageSubresource.layerCount = 1;
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readbackBuffer, 1, &info);
     }
 
-    /* Draw the triangle */
-    vkCmdDraw(cmd, 3, 1, 0, 0);
+    /* Make the transfer operation visible to the host */
+    {
+        VkMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
 
     /* End recording */
-    cmd.endRenderPass()
-       .end();
+    cmd.end();
 
     /* Fence to wait on command buffer completeness */
     Vk::Fence fence{device};
@@ -338,7 +382,7 @@ int main(int argc, char** argv) {
             .loadAndInstantiate("AnyImageConverter")
     )->exportToFile(ImageView2D{
         PixelFormat::RGBA8Unorm, {800, 600},
-        image.dedicatedMemory().mapRead()}, "image.png");
+        readbackBuffer.dedicatedMemory().mapRead()}, "image.png");
     Debug{} << "Saved an image to image.png";
 
     /* Clean up */
